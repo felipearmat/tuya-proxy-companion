@@ -61,14 +61,14 @@ intercept the camera's cloud MQTT traffic using iptables.
 4. **Transparent relay** — unknown cameras are forwarded to the real broker.
 
 ```
-Camera (192.168.x.x)
-  │  TCP :8883 → m.tuyaus.com (resolved to HA server via AdGuard)
+Camera (LAN)
+  │  TCP :8883 → m.tuyaus.com (no DNS rewrite needed — iptables intercepts at L3)
   │
   ▼ iptables PREROUTING REDIRECT (host network)
   │  TCP :18883
   │
   ▼ Companion MITM proxy
-  ├── Known camera → DP 185 detected → Frigate
+  ├── Known camera → DP 212 detected → Frigate
   └── Unknown camera → relay to m.tuyaus.com:8883
 ```
 
@@ -94,10 +94,11 @@ Camera (192.168.x.x)
 3. The add-on `Tuya Proxy Companion` should appear under **Local add-ons**.
 4. Install → Start.
 
-### From a repository (future)
+### From a repository
 
-Once published to a repository, add the URL in
-**Settings → Add-ons → Store → ⋮ → Repositories** and install from there.
+1. In Home Assistant: **Settings → Add-ons → Store → ⋮ → Repositories**.
+2. Add `https://github.com/felipearmat/tuya-proxy-companion`.
+3. Search for **Tuya Proxy Companion** and click **Install**.
 
 ---
 
