@@ -1,7 +1,7 @@
 FROM alpine:3.19
 
 RUN apk add --no-cache python3 py3-pip iptables openssl \
-    && pip3 install --no-cache-dir --break-system-packages aiohttp cryptography
+    && pip3 install --no-cache-dir --break-system-packages aiohttp cryptography tinytuya
 
 COPY proxy/ /proxy/
 COPY run.sh /run.sh

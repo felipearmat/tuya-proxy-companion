@@ -13,39 +13,63 @@ Designed to work alongside the
 
 ## How it works
 
-Tuya cameras connect to the cloud MQTT broker (`m.tuyaus.com`) on **port 8883
-over TLS**. The companion intercepts that traffic by:
+The companion uses two complementary approaches to detect motion from Tuya cameras:
 
-1. **iptables PREROUTING redirect** — for each camera with proxy mode enabled,
-   a `REDIRECT` rule rewrites the destination port from 8883 → proxy port
-   (default 18883) *before* the packet leaves the kernel. This is surgical:
-   only packets from that specific camera IP are affected; all other MQTT
-   traffic on the network continues to reach the real broker.
+### Primary: Local Tuya Protocol (LAN-based)
 
-2. **TLS MITM** — the proxy presents a self-signed TLS certificate to the
-   camera (generated at startup and cached in `/data/proxy_certs/`). The camera
-   connects believing it is talking to the cloud broker.
+The camera is reachable on the local network via Tuya's local protocol on
+**port 6668 (TCP)**. The companion maintains a persistent connection and
+receives DP (Data Point) updates pushed by the camera — no internet path
+involved.
 
-3. **Motion detection** — the proxy parses Tuya MQTT payloads and looks for
-   the alarm DP (Data Point 185). When a motion event is detected, it fires a
-   manual motion event to Frigate via its HTTP API.
+1. **Persistent TCP connection** — opened to the camera's LAN IP on startup
+   (or when the camera is enabled). Uses the `device_id` and `local_key`
+   stored in eKaza Wizard.
 
-4. **Transparent relay (unknown cameras)** — cameras that are not in the
-   proxy-enabled list are forwarded transparently to the real broker, so no
-   traffic is disrupted.
+2. **Protocol 3.5 key exchange** — the companion authenticates via the Tuya
+   local protocol, establishing an encrypted session with the camera.
+
+3. **DP 212 detection** — incoming DP updates are inspected for DP 212 (ipc_motion
+   alarm payload). The value is a base64-encoded JSON: `{"cmd":"ipc_motion","alarm":true,...}`.
+   When `alarm` is truthy or `cmd` is `"ipc_motion"`, a motion event is posted to Frigate.
+
+4. **Auto-reconnect** — if the connection drops, the companion retries after
+   10 seconds. This approach is immune to DNS or cloud routing changes.
+
+```
+Camera (LAN)
+  │  Tuya local v3.5 (TCP :6668)
+  │
+  ▼ Companion persistent listener
+  └── DP 212 push (ipc_motion) → POST /api/events/{slug}/motion/create → Frigate
+```
+
+### Secondary: Cloud MQTT MITM (iptables-based)
+
+For cameras where local protocol access is unavailable, the companion can
+intercept the camera's cloud MQTT traffic using iptables.
+
+1. **iptables PREROUTING redirect** — a `REDIRECT` rule rewrites destination
+   port 8883 → proxy port (default 18883). Traffic is intercepted at the
+   network level; no DNS rewrite is needed when the primary local listener is active.
+
+2. **TLS MITM** — the proxy presents a self-signed certificate to the camera.
+   The camera connects believing it reached the cloud broker.
+
+3. **Motion detection** — parses Tuya MQTT payloads for DP 212 (ipc_motion).
+
+4. **Transparent relay** — unknown cameras are forwarded to the real broker.
 
 ```
 Camera (192.168.x.x)
-  │  TCP :8883 (TLS, to m.tuyaus.com)
+  │  TCP :8883 → m.tuyaus.com (resolved to HA server via AdGuard)
   │
   ▼ iptables PREROUTING REDIRECT (host network)
   │  TCP :18883
   │
   ▼ Companion MITM proxy
-  ├── Known camera → parse payload → DP 185 detected?
-  │     └── yes → POST /api/events/{slug}/motion/create → Frigate
-  │     └── no  → discard (camera thinks it reached the cloud)
-  └── Unknown camera → relay to m.tuyaus.com:8883 transparently
+  ├── Known camera → DP 185 detected → Frigate
+  └── Unknown camera → relay to m.tuyaus.com:8883
 ```
 
 ---
@@ -54,9 +78,9 @@ Camera (192.168.x.x)
 
 | Requirement | Why |
 |---|---|
-| `NET_ADMIN` capability | Required to manage iptables rules |
+| `NET_ADMIN` capability | Required to manage iptables rules (MITM path) |
 | `host_network: true` | iptables rules apply to the host network stack |
-| eKaza Wizard integration | Provides camera list and triggers iptables sync |
+| eKaza Wizard integration | Provides camera list (including `device_id` and `local_key`) |
 | Frigate NVR | Receives motion events |
 
 ---

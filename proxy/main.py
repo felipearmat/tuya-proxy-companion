@@ -17,10 +17,11 @@ from aiohttp import web
 
 from .iptables_manager import IptablesManager
 from .mitm_proxy import MitmProxy
+from .tuya_listener import TuyaLocalListener
 
 _LOGGER = logging.getLogger(__name__)
 _OPTIONS_FILE = Path("/data/options.json")
-_VERSION = "0.1.0"
+_VERSION = "0.2.0"
 
 
 def _load_options() -> dict:
@@ -101,6 +102,7 @@ class CompanionApp:
         self._session: aiohttp.ClientSession | None = None
         self._iptables = IptablesManager(camera_mqtt_port=self._camera_mqtt_port)
         self._proxy = MitmProxy(on_motion=self._on_motion)
+        self._listeners: dict[str, TuyaLocalListener] = {}
         self._cameras: list[dict] = []
 
     async def _on_motion(self, slug: str) -> None:
@@ -132,6 +134,9 @@ class CompanionApp:
     async def shutdown(self) -> None:
         await self._proxy.stop()
         await self._iptables.flush()
+        for listener in list(self._listeners.values()):
+            await listener.stop()
+        self._listeners.clear()
         if self._session:
             await self._session.close()
 
@@ -144,11 +149,36 @@ class CompanionApp:
             c["ip"] for c in cameras if c.get("proxy_enabled") and c.get("ip")
         }
         active_ips = {r["cam_ip"] for r in self._iptables.active_rules}
-
         for ip in enabled_ips - active_ips:
             await self._iptables.add(ip, self._proxy_port)
         for ip in active_ips - enabled_ips:
             await self._iptables.remove(ip)
+
+        # Reconcile local Tuya listeners: start for proxy-enabled cameras with credentials
+        desired = {
+            c["slug"]: c
+            for c in cameras
+            if c.get("proxy_enabled")
+            and c.get("device_id")
+            and c.get("local_key")
+            and c.get("ip")
+        }
+        current_slugs = set(self._listeners)
+
+        for slug in current_slugs - set(desired):
+            await self._listeners.pop(slug).stop()
+
+        for slug, cam in desired.items():
+            if slug not in current_slugs:
+                listener = TuyaLocalListener(
+                    slug=slug,
+                    ip=cam["ip"],
+                    device_id=cam["device_id"],
+                    local_key=cam["local_key"],
+                    on_motion=self._on_motion,
+                )
+                self._listeners[slug] = listener
+                listener.start()
 
     def status(self) -> dict:
         return {
@@ -158,6 +188,10 @@ class CompanionApp:
             "camera_mqtt_port": self._camera_mqtt_port,
             "cameras": self._cameras,
             "iptables_rules": self._iptables.active_rules,
+            "local_listeners": [
+                {"slug": slug, "running": lst.is_running}
+                for slug, lst in self._listeners.items()
+            ],
         }
 
 
