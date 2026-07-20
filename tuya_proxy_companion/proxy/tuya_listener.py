@@ -30,6 +30,27 @@ except ImportError:
     _TINYTUYA_OK = False
 
 
+def _is_alarm(alarm_val: object) -> bool:
+    """Return True if a DP 212 value represents a motion alarm.
+
+    DP 212 on eKaza cameras is a base64-encoded JSON with keys 'cmd' and 'alarm'.
+    Any value that cannot be decoded is treated as an alarm (fail-safe).
+    """
+    if isinstance(alarm_val, str):
+        try:
+            payload = json.loads(base64.b64decode(alarm_val).decode())
+            _LOGGER.debug(
+                "DP%d payload: cmd=%s alarm=%s",
+                _ALARM_DP,
+                payload.get("cmd"),
+                payload.get("alarm"),
+            )
+            return bool(payload.get("alarm")) or payload.get("cmd") == "ipc_motion"
+        except Exception:
+            return True  # unparseable → treat as alarm (fail-safe)
+    return bool(alarm_val)
+
+
 class TuyaLocalListener:
     """Persistent local Tuya listener for a single camera.
 
@@ -138,28 +159,7 @@ class TuyaLocalListener:
             if not alarm_val:
                 continue
 
-            # DP 212 value is a base64-encoded JSON; parse to confirm it's an alarm.
-            is_alarm = False
-            if isinstance(alarm_val, str):
-                try:
-                    payload = json.loads(base64.b64decode(alarm_val).decode())
-                    _LOGGER.info(
-                        "Local Tuya: DP%d payload from %s: cmd=%s alarm=%s",
-                        _ALARM_DP,
-                        self._slug,
-                        payload.get("cmd"),
-                        payload.get("alarm"),
-                    )
-                    is_alarm = (
-                        bool(payload.get("alarm")) or payload.get("cmd") == "ipc_motion"
-                    )
-                except Exception:
-                    # If we can't parse it, treat any non-empty value as alarm.
-                    is_alarm = True
-            else:
-                is_alarm = bool(alarm_val)
-
-            if is_alarm:
+            if _is_alarm(alarm_val):
                 _LOGGER.info(
                     "Motion detected (local Tuya DP%d) on %s", _ALARM_DP, self._slug
                 )
