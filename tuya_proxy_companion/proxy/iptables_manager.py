@@ -83,24 +83,21 @@ class IptablesManager:
     # ------------------------------------------------------------------
 
     async def enable_gateway(self, cam_ip: str) -> bool:
-        """Enable ip_forward and block external port 8883 for cam_ip.
+        """Block all internet traffic from cam_ip via the FORWARD chain.
 
         Called after ARP spoofing routes the camera's traffic through this host.
-        Allows the camera to reach the internet normally except Tuya cloud MQTT
-        (port 8883), which is dropped in the FORWARD chain.
+        Host ip_forward is typically 1 (Docker sets it), so the FORWARD chain is
+        active. Dropping all FORWARD from camera blocks every cloud port; port
+        8883 is additionally intercepted by the PREROUTING REDIRECT before it
+        even reaches the FORWARD chain.
         """
-        # Enable kernel IP forwarding (best-effort; container may have read-only /proc/sys)
         try:
-            Path("/proc/sys/net/ipv4/ip_forward").write_text("1")
-        except Exception as exc:
-            _LOGGER.warning(
-                "ip_forward not writable (%s); FORWARD mode disabled — "
-                "all camera internet traffic will be blocked via ARP drop, "
-                "PREROUTING REDIRECT still intercepts port 8883",
-                exc,
-            )
+            ip_fwd = Path("/proc/sys/net/ipv4/ip_forward").read_text().strip()
+            _LOGGER.info("ip_forward=%s (host kernel)", ip_fwd)
+        except Exception:
+            ip_fwd = "unknown"
 
-        # MASQUERADE: rewrite src IP on forwarded packets so replies come back
+        # MASQUERADE: kept for future use; effectively unreachable while FORWARD drops all.
         exists, _ = await self._run_nat(
             "-C", "POSTROUTING", "-s", cam_ip, "-j", "MASQUERADE"
         )
@@ -110,38 +107,40 @@ class IptablesManager:
             )
             if not ok:
                 _LOGGER.error("iptables: MASQUERADE add failed for %s: %s", cam_ip, msg)
-                return False
 
-        # FORWARD DROP port 8883: blocks Tuya cloud MQTT — insert at position 1 so it
-        # runs before any generic ACCEPT rules
-        drop_args = ("-s", cam_ip, "-p", "tcp", "--dport", "8883", "-j", "DROP")
-        exists, _ = await self._run_filter("-C", "FORWARD", *drop_args)
+        # Remove legacy per-port rules left by older versions (idempotent).
+        old_drop_8883 = ("-s", cam_ip, "-p", "tcp", "--dport", "8883", "-j", "DROP")
+        old_accept = ("-s", cam_ip, "-j", "ACCEPT")
+        for old_rule in (old_drop_8883, old_accept):
+            exists, _ = await self._run_filter("-C", "FORWARD", *old_rule)
+            if exists:
+                await self._run_filter("-D", "FORWARD", *old_rule)
+                _LOGGER.info("iptables: removed legacy FORWARD rule for %s", cam_ip)
+
+        # DROP all FORWARD from camera — blocks every internet port (443, 8883, 8886…).
+        # Port 8883 is already redirected to MITM via PREROUTING before reaching here.
+        # Insert at position 1 so it wins over any existing generic ACCEPT rules.
+        drop_all = ("-s", cam_ip, "-j", "DROP")
+        exists, _ = await self._run_filter("-C", "FORWARD", *drop_all)
         if not exists:
-            ok, msg = await self._run_filter("-I", "FORWARD", "1", *drop_args)
+            ok, msg = await self._run_filter("-I", "FORWARD", "1", *drop_all)
             if not ok:
                 _LOGGER.error(
-                    "iptables: FORWARD DROP 8883 failed for %s: %s", cam_ip, msg
+                    "iptables: FORWARD DROP all failed for %s: %s", cam_ip, msg
                 )
-
-        # FORWARD ACCEPT: allow all other traffic from camera to pass through
-        fwd_args = ("-s", cam_ip, "-j", "ACCEPT")
-        exists, _ = await self._run_filter("-C", "FORWARD", *fwd_args)
-        if not exists:
-            await self._run_filter("-A", "FORWARD", *fwd_args)
 
         self._gateway_ips.add(cam_ip)
         _LOGGER.info(
-            "iptables: gateway mode enabled for %s (port 8883 blocked)", cam_ip
+            "iptables: gateway mode enabled for %s (all internet blocked, ip_forward=%s)",
+            cam_ip,
+            ip_fwd,
         )
         return True
 
     async def disable_gateway(self, cam_ip: str) -> None:
         """Remove FORWARD and MASQUERADE rules for cam_ip."""
         await self._run_nat("-D", "POSTROUTING", "-s", cam_ip, "-j", "MASQUERADE")
-        await self._run_filter(
-            "-D", "FORWARD", "-s", cam_ip, "-p", "tcp", "--dport", "8883", "-j", "DROP"
-        )
-        await self._run_filter("-D", "FORWARD", "-s", cam_ip, "-j", "ACCEPT")
+        await self._run_filter("-D", "FORWARD", "-s", cam_ip, "-j", "DROP")
         self._gateway_ips.discard(cam_ip)
         _LOGGER.info("iptables: gateway mode disabled for %s", cam_ip)
 
