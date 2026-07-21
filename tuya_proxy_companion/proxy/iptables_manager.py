@@ -89,12 +89,16 @@ class IptablesManager:
         Allows the camera to reach the internet normally except Tuya cloud MQTT
         (port 8883), which is dropped in the FORWARD chain.
         """
-        # Enable kernel IP forwarding
+        # Enable kernel IP forwarding (best-effort; container may have read-only /proc/sys)
         try:
             Path("/proc/sys/net/ipv4/ip_forward").write_text("1")
         except Exception as exc:
-            _LOGGER.error("ip_forward: %s", exc)
-            return False
+            _LOGGER.warning(
+                "ip_forward not writable (%s); FORWARD mode disabled — "
+                "all camera internet traffic will be blocked via ARP drop, "
+                "PREROUTING REDIRECT still intercepts port 8883",
+                exc,
+            )
 
         # MASQUERADE: rewrite src IP on forwarded packets so replies come back
         exists, _ = await self._run_nat(
