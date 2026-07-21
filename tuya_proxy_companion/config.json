@@ -1,7 +1,7 @@
 {
   "name": "Tuya Proxy Companion",
   "description": "MQTT MITM proxy for Tuya-based cameras. Intercepts cloud traffic and routes motion events locally to Frigate — no SmartLife required.",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "slug": "tuya_proxy_companion",
   "url": "https://github.com/felipearmat/tuya-proxy-companion",
   "arch": ["aarch64", "amd64", "armhf", "armv7", "i386"],
