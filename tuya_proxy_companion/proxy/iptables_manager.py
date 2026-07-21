@@ -83,6 +83,10 @@ class IptablesManager:
             for ip, tp in sorted(self._active)
         ]
 
+    @property
+    def gateway_ips(self) -> frozenset[str]:
+        return frozenset(self._gateway_ips)
+
     # ------------------------------------------------------------------
     # Gateway mode: PREROUTING intercept on MQTT ports + FORWARD ACCEPT rest
     # ------------------------------------------------------------------

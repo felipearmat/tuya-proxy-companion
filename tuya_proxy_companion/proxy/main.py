@@ -150,21 +150,32 @@ class CompanionApp:
         self._cameras = cameras
         self._proxy.update_cameras(cameras)
 
-        # Reconcile iptables + ARP spoof: add rules for proxy-enabled cameras, remove for others
-        enabled_ips = {
-            c["ip"] for c in cameras if c.get("proxy_enabled") and c.get("ip")
-        }
-        active_ips = {r["cam_ip"] for r in self._iptables.active_rules}
-        for ip in enabled_ips - active_ips:
+        # PROXY: PREROUTING REDIRECT for primary MQTT port — controlled by proxy_enabled.
+        # Intercepts the camera's MQTT events via DNS rewrite so they reach Frigate.
+        proxy_ips = {c["ip"] for c in cameras if c.get("proxy_enabled") and c.get("ip")}
+        active_proxy_ips = {r["cam_ip"] for r in self._iptables.active_rules}
+        for ip in proxy_ips - active_proxy_ips:
             await self._iptables.add(ip, self._proxy_port)
-            await self._iptables.enable_gateway(ip)
-            await self._arp_spoof.start(ip)
-        for ip in active_ips - enabled_ips:
-            await self._arp_spoof.stop(ip)
-            await self._iptables.disable_gateway(ip)
+        for ip in active_proxy_ips - proxy_ips:
             await self._iptables.remove(ip)
 
-        # Reconcile local Tuya listeners: start for proxy-enabled cameras with credentials
+        # PRIVACY: ARP spoof + gateway FORWARD rules — controlled by privacy_blocked.
+        # Requires proxy_enabled (DP212 relies on MITM being active). Activates when the
+        # "Bloqueio SmartLife/Tuya" feature is enabled in ekaza_wizard Privacidade tab.
+        privacy_ips = {
+            c["ip"]
+            for c in cameras
+            if c.get("proxy_enabled") and c.get("privacy_blocked") and c.get("ip")
+        }
+        active_gw_ips = self._iptables.gateway_ips
+        for ip in privacy_ips - active_gw_ips:
+            await self._iptables.enable_gateway(ip)
+            await self._arp_spoof.start(ip)
+        for ip in active_gw_ips - privacy_ips:
+            await self._arp_spoof.stop(ip)
+            await self._iptables.disable_gateway(ip)
+
+        # LOCAL TUYA LISTENERS: DP212 events → Frigate — controlled by proxy_enabled.
         desired = {
             c["slug"]: c
             for c in cameras
@@ -198,6 +209,7 @@ class CompanionApp:
             "camera_mqtt_port": self._camera_mqtt_port,
             "cameras": self._cameras,
             "iptables_rules": self._iptables.active_rules,
+            "gateway_ips": sorted(self._iptables.gateway_ips),
             "local_listeners": [
                 {"slug": slug, "running": lst.is_running}
                 for slug, lst in self._listeners.items()
