@@ -8,31 +8,36 @@ from pathlib import Path
 
 _LOGGER = logging.getLogger(__name__)
 
+# Tuya cloud MQTT runs on these ports; all are intercepted by PREROUTING REDIRECT.
+_MQTT_INTERCEPT_PORTS = (8883, 8886, 443)
+
 
 class IptablesManager:
     """Manage per-camera iptables rules.
 
-    PREROUTING REDIRECT: redirects camera's TCP traffic on camera_mqtt_port to
-    proxy_port so the MITM proxy can intercept it (works when camera connects to
-    this host via DNS rewrite).
+    PREROUTING REDIRECT: redirects camera's TCP traffic on the configured MQTT
+    port (and additional MQTT ports in gateway mode) to proxy_port so the MITM
+    proxy can intercept cloud MQTT.
 
     Gateway mode (enable_gateway / disable_gateway): used together with ARP
-    spoofing to intercept camera traffic that bypasses DNS. Sets up ip_forward,
-    MASQUERADE, and FORWARD DROP on port 8883 to block Tuya cloud MQTT.
+    spoofing to intercept camera traffic that bypasses DNS. Redirects all known
+    Tuya MQTT ports (8883, 8886, 443) to the MITM proxy and allows all other
+    internet traffic so the camera can reach NTP, firmware servers, etc.
     """
 
-    def __init__(self, camera_mqtt_port: int = 8883) -> None:
+    def __init__(self, camera_mqtt_port: int = 8883, proxy_port: int = 18883) -> None:
         self._from_port = camera_mqtt_port
+        self._proxy_port = proxy_port
         self._active: set[tuple[str, int]] = set()  # (cam_ip, to_port)
         self._gateway_ips: set[str] = set()
 
     # ------------------------------------------------------------------
-    # PREROUTING REDIRECT (existing behaviour)
+    # PREROUTING REDIRECT (primary port only — add() called by apply_cameras)
     # ------------------------------------------------------------------
 
     async def add(self, cam_ip: str, to_port: int) -> bool:
         """Add PREROUTING REDIRECT for cam_ip → to_port. Idempotent."""
-        args = self._redirect_args(cam_ip, to_port)
+        args = self._redirect_args(cam_ip, self._from_port, to_port)
         exists, _ = await self._run_nat("-C", "PREROUTING", *args)
         if exists:
             self._active.add((cam_ip, to_port))
@@ -54,7 +59,7 @@ class IptablesManager:
         for ip, to_port in list(self._active):
             if ip != cam_ip:
                 continue
-            args = self._redirect_args(ip, to_port)
+            args = self._redirect_args(ip, self._from_port, to_port)
             exists, _ = await self._run_nat("-C", "PREROUTING", *args)
             if exists:
                 ok, msg = await self._run_nat("-D", "PREROUTING", *args)
@@ -79,17 +84,17 @@ class IptablesManager:
         ]
 
     # ------------------------------------------------------------------
-    # Gateway mode: ip_forward + MASQUERADE + FORWARD DROP port 8883
+    # Gateway mode: PREROUTING intercept on MQTT ports + FORWARD ACCEPT rest
     # ------------------------------------------------------------------
 
     async def enable_gateway(self, cam_ip: str) -> bool:
-        """Block all internet traffic from cam_ip via the FORWARD chain.
+        """Intercept Tuya MQTT ports and allow other internet traffic for cam_ip.
 
         Called after ARP spoofing routes the camera's traffic through this host.
-        Host ip_forward is typically 1 (Docker sets it), so the FORWARD chain is
-        active. Dropping all FORWARD from camera blocks every cloud port; port
-        8883 is additionally intercepted by the PREROUTING REDIRECT before it
-        even reaches the FORWARD chain.
+        Redirects ports 8883, 8886, and 443 to the MITM proxy so the camera's
+        MQTT connections fail at the TLS layer. All other traffic is forwarded
+        normally so the camera can reach NTP, firmware servers, etc. — this
+        keeps local DP212 reporting alive without enabling cloud notifications.
         """
         try:
             ip_fwd = Path("/proc/sys/net/ipv4/ip_forward").read_text().strip()
@@ -97,7 +102,7 @@ class IptablesManager:
         except Exception:
             ip_fwd = "unknown"
 
-        # MASQUERADE: kept for future use; effectively unreachable while FORWARD drops all.
+        # MASQUERADE: rewrite src IP on forwarded packets so replies come back.
         exists, _ = await self._run_nat(
             "-C", "POSTROUTING", "-s", cam_ip, "-j", "MASQUERADE"
         )
@@ -108,39 +113,97 @@ class IptablesManager:
             if not ok:
                 _LOGGER.error("iptables: MASQUERADE add failed for %s: %s", cam_ip, msg)
 
-        # Remove legacy per-port rules left by older versions (idempotent).
-        old_drop_8883 = ("-s", cam_ip, "-p", "tcp", "--dport", "8883", "-j", "DROP")
-        old_accept = ("-s", cam_ip, "-j", "ACCEPT")
-        for old_rule in (old_drop_8883, old_accept):
+        # Remove legacy rules left by v0.2.9 and v0.3.0 (idempotent).
+        legacy = [
+            ("-s", cam_ip, "-p", "tcp", "--dport", "8883", "-j", "DROP"),  # v0.2.9
+            ("-s", cam_ip, "-j", "ACCEPT"),  # v0.2.9
+            ("-s", cam_ip, "-j", "DROP"),  # v0.3.0 drop-all
+        ]
+        for old_rule in legacy:
             exists, _ = await self._run_filter("-C", "FORWARD", *old_rule)
             if exists:
                 await self._run_filter("-D", "FORWARD", *old_rule)
                 _LOGGER.info("iptables: removed legacy FORWARD rule for %s", cam_ip)
 
-        # DROP all FORWARD from camera — blocks every internet port (443, 8883, 8886…).
-        # Port 8883 is already redirected to MITM via PREROUTING before reaching here.
-        # Insert at position 1 so it wins over any existing generic ACCEPT rules.
-        drop_all = ("-s", cam_ip, "-j", "DROP")
-        exists, _ = await self._run_filter("-C", "FORWARD", *drop_all)
+        # PREROUTING REDIRECT for extra MQTT ports (port 8883 handled by add()).
+        for port in _MQTT_INTERCEPT_PORTS:
+            if port == self._from_port:
+                continue  # already added by add()
+            args = self._redirect_args(cam_ip, port, self._proxy_port)
+            exists, _ = await self._run_nat("-C", "PREROUTING", *args)
+            if not exists:
+                ok, msg = await self._run_nat("-A", "PREROUTING", *args)
+                if ok:
+                    _LOGGER.info(
+                        "iptables: REDIRECT %s:%d→%d added",
+                        cam_ip,
+                        port,
+                        self._proxy_port,
+                    )
+                else:
+                    _LOGGER.error(
+                        "iptables: REDIRECT %s:%d failed: %s", cam_ip, port, msg
+                    )
+
+        # FORWARD DROP for MQTT ports: belt-and-suspenders in case PREROUTING
+        # is bypassed (e.g. packets already in ESTABLISHED state before spoof).
+        # Insert at position 1 so these win before the ACCEPT below.
+        for port in _MQTT_INTERCEPT_PORTS:
+            drop_args = ("-s", cam_ip, "-p", "tcp", "--dport", str(port), "-j", "DROP")
+            exists, _ = await self._run_filter("-C", "FORWARD", *drop_args)
+            if not exists:
+                ok, msg = await self._run_filter("-I", "FORWARD", "1", *drop_args)
+                if not ok:
+                    _LOGGER.error(
+                        "iptables: FORWARD DROP %d failed for %s: %s", port, cam_ip, msg
+                    )
+
+        # FORWARD ACCEPT: let all other camera traffic reach the internet so
+        # the camera can use NTP, firmware updates, etc. This keeps DP212 alive.
+        accept_args = ("-s", cam_ip, "-j", "ACCEPT")
+        exists, _ = await self._run_filter("-C", "FORWARD", *accept_args)
         if not exists:
-            ok, msg = await self._run_filter("-I", "FORWARD", "1", *drop_all)
-            if not ok:
-                _LOGGER.error(
-                    "iptables: FORWARD DROP all failed for %s: %s", cam_ip, msg
-                )
+            await self._run_filter("-A", "FORWARD", *accept_args)
 
         self._gateway_ips.add(cam_ip)
         _LOGGER.info(
-            "iptables: gateway mode enabled for %s (all internet blocked, ip_forward=%s)",
+            "iptables: gateway mode enabled for %s "
+            "(MQTT ports %s intercepted, other internet allowed, ip_forward=%s)",
             cam_ip,
+            "/".join(str(p) for p in _MQTT_INTERCEPT_PORTS),
             ip_fwd,
         )
         return True
 
     async def disable_gateway(self, cam_ip: str) -> None:
-        """Remove FORWARD and MASQUERADE rules for cam_ip."""
+        """Remove FORWARD, MASQUERADE, and extra PREROUTING rules for cam_ip."""
         await self._run_nat("-D", "POSTROUTING", "-s", cam_ip, "-j", "MASQUERADE")
-        await self._run_filter("-D", "FORWARD", "-s", cam_ip, "-j", "DROP")
+
+        # Remove extra PREROUTING REDIRECTs added by enable_gateway.
+        for port in _MQTT_INTERCEPT_PORTS:
+            if port == self._from_port:
+                continue
+            args = self._redirect_args(cam_ip, port, self._proxy_port)
+            await self._run_nat("-D", "PREROUTING", *args)
+
+        # Remove per-port FORWARD DROPs.
+        for port in _MQTT_INTERCEPT_PORTS:
+            await self._run_filter(
+                "-D",
+                "FORWARD",
+                "-s",
+                cam_ip,
+                "-p",
+                "tcp",
+                "--dport",
+                str(port),
+                "-j",
+                "DROP",
+            )
+
+        # Remove FORWARD ACCEPT.
+        await self._run_filter("-D", "FORWARD", "-s", cam_ip, "-j", "ACCEPT")
+
         self._gateway_ips.discard(cam_ip)
         _LOGGER.info("iptables: gateway mode disabled for %s", cam_ip)
 
@@ -148,14 +211,16 @@ class IptablesManager:
     # Internals
     # ------------------------------------------------------------------
 
-    def _redirect_args(self, cam_ip: str, to_port: int) -> tuple[str, ...]:
+    def _redirect_args(
+        self, cam_ip: str, from_port: int, to_port: int
+    ) -> tuple[str, ...]:
         return (
             "-s",
             cam_ip,
             "-p",
             "tcp",
             "--dport",
-            str(self._from_port),
+            str(from_port),
             "-j",
             "REDIRECT",
             "--to-port",

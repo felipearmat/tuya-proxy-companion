@@ -101,7 +101,10 @@ class CompanionApp:
         self._camera_mqtt_port: int = int(opts.get("camera_mqtt_port", 8883))
         self._api_port: int = int(opts.get("api_port", 8765))
         self._session: aiohttp.ClientSession | None = None
-        self._iptables = IptablesManager(camera_mqtt_port=self._camera_mqtt_port)
+        self._iptables = IptablesManager(
+            camera_mqtt_port=self._camera_mqtt_port,
+            proxy_port=self._proxy_port,
+        )
         self._arp_spoof = ArpSpoofManager()
         self._proxy = MitmProxy(on_motion=self._on_motion)
         self._listeners: dict[str, TuyaLocalListener] = {}
