@@ -101,6 +101,7 @@ class CompanionApp:
         self._api_port: int = int(opts.get("api_port", 8765))
         self._session: aiohttp.ClientSession | None = None
         self._iptables = IptablesManager(camera_mqtt_port=self._camera_mqtt_port)
+        self._arp_spoof = ArpSpoofManager()
         self._proxy = MitmProxy(on_motion=self._on_motion)
         self._listeners: dict[str, TuyaLocalListener] = {}
         self._cameras: list[dict] = []
@@ -133,6 +134,7 @@ class CompanionApp:
 
     async def shutdown(self) -> None:
         await self._proxy.stop()
+        await self._arp_spoof.stop_all()
         await self._iptables.flush()
         for listener in list(self._listeners.values()):
             await listener.stop()
@@ -144,14 +146,18 @@ class CompanionApp:
         self._cameras = cameras
         self._proxy.update_cameras(cameras)
 
-        # Reconcile iptables: add rules for proxy-enabled cameras, remove for others
+        # Reconcile iptables + ARP spoof: add rules for proxy-enabled cameras, remove for others
         enabled_ips = {
             c["ip"] for c in cameras if c.get("proxy_enabled") and c.get("ip")
         }
         active_ips = {r["cam_ip"] for r in self._iptables.active_rules}
         for ip in enabled_ips - active_ips:
             await self._iptables.add(ip, self._proxy_port)
+            await self._iptables.enable_gateway(ip)
+            await self._arp_spoof.start(ip)
         for ip in active_ips - enabled_ips:
+            await self._arp_spoof.stop(ip)
+            await self._iptables.disable_gateway(ip)
             await self._iptables.remove(ip)
 
         # Reconcile local Tuya listeners: start for proxy-enabled cameras with credentials
