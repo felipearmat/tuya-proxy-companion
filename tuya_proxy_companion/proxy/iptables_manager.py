@@ -147,7 +147,7 @@ class IptablesManager:
 
         # FORWARD DROP for MQTT ports: belt-and-suspenders in case PREROUTING
         # is bypassed (e.g. packets already in ESTABLISHED state before spoof).
-        # Insert at position 1 so these win before the ACCEPT below.
+        # Insert at position 1 so these win before the rules below.
         for port in _MQTT_INTERCEPT_PORTS:
             drop_args = ("-s", cam_ip, "-p", "tcp", "--dport", str(port), "-j", "DROP")
             exists, _ = await self._run_filter("-C", "FORWARD", *drop_args)
@@ -158,9 +158,39 @@ class IptablesManager:
                         "iptables: FORWARD DROP %d failed for %s: %s", port, cam_ip, msg
                     )
 
-        # FORWARD ACCEPT: let all other camera traffic reach the internet so
-        # the camera can use NTP, firmware updates, etc. This keeps DP212 alive.
-        accept_args = ("-s", cam_ip, "-j", "ACCEPT")
+        # FORWARD DROP TCP port 80 (plain HTTP — no legitimate cloud data path).
+        http_drop = ("-s", cam_ip, "-p", "tcp", "--dport", "80", "-j", "DROP")
+        exists, _ = await self._run_filter("-C", "FORWARD", *http_drop)
+        if not exists:
+            await self._run_filter("-A", "FORWARD", *http_drop)
+
+        # FORWARD ACCEPT UDP DNS (53) and NTP (123) — camera needs these to
+        # function; all other UDP (WebRTC DTLS, STUN/TURN, QUIC) is dropped.
+        for udp_port in (53, 123):
+            udp_accept = (
+                "-s",
+                cam_ip,
+                "-p",
+                "udp",
+                "--dport",
+                str(udp_port),
+                "-j",
+                "ACCEPT",
+            )
+            exists, _ = await self._run_filter("-C", "FORWARD", *udp_accept)
+            if not exists:
+                await self._run_filter("-A", "FORWARD", *udp_accept)
+
+        # FORWARD DROP all other UDP from camera.
+        udp_drop = ("-s", cam_ip, "-p", "udp", "-j", "DROP")
+        exists, _ = await self._run_filter("-C", "FORWARD", *udp_drop)
+        if not exists:
+            await self._run_filter("-A", "FORWARD", *udp_drop)
+
+        # FORWARD ACCEPT remaining TCP so the camera can make cloud connection
+        # attempts on non-standard ports — these keep DP212 alive (camera stays
+        # in "reconnecting" state rather than going fully offline).
+        accept_args = ("-s", cam_ip, "-p", "tcp", "-j", "ACCEPT")
         exists, _ = await self._run_filter("-C", "FORWARD", *accept_args)
         if not exists:
             await self._run_filter("-A", "FORWARD", *accept_args)
@@ -168,7 +198,7 @@ class IptablesManager:
         self._gateway_ips.add(cam_ip)
         _LOGGER.info(
             "iptables: gateway mode enabled for %s "
-            "(MQTT ports %s intercepted, other internet allowed, ip_forward=%s)",
+            "(MQTT %s → MITM; UDP blocked except DNS/NTP; HTTP blocked; ip_forward=%s)",
             cam_ip,
             "/".join(str(p) for p in _MQTT_INTERCEPT_PORTS),
             ip_fwd,
@@ -186,7 +216,7 @@ class IptablesManager:
             args = self._redirect_args(cam_ip, port, self._proxy_port)
             await self._run_nat("-D", "PREROUTING", *args)
 
-        # Remove per-port FORWARD DROPs.
+        # Remove per-port FORWARD DROPs (MQTT ports + HTTP).
         for port in _MQTT_INTERCEPT_PORTS:
             await self._run_filter(
                 "-D",
@@ -200,9 +230,30 @@ class IptablesManager:
                 "-j",
                 "DROP",
             )
+        await self._run_filter(
+            "-D", "FORWARD", "-s", cam_ip, "-p", "tcp", "--dport", "80", "-j", "DROP"
+        )
 
-        # Remove FORWARD ACCEPT.
-        await self._run_filter("-D", "FORWARD", "-s", cam_ip, "-j", "ACCEPT")
+        # Remove UDP rules (DNS/NTP ACCEPTs + blanket DROP).
+        for udp_port in (53, 123):
+            await self._run_filter(
+                "-D",
+                "FORWARD",
+                "-s",
+                cam_ip,
+                "-p",
+                "udp",
+                "--dport",
+                str(udp_port),
+                "-j",
+                "ACCEPT",
+            )
+        await self._run_filter("-D", "FORWARD", "-s", cam_ip, "-p", "udp", "-j", "DROP")
+
+        # Remove TCP FORWARD ACCEPT (remaining traffic).
+        await self._run_filter(
+            "-D", "FORWARD", "-s", cam_ip, "-p", "tcp", "-j", "ACCEPT"
+        )
 
         self._gateway_ips.discard(cam_ip)
         _LOGGER.info("iptables: gateway mode disabled for %s", cam_ip)
