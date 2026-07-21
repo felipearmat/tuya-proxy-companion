@@ -1,10 +1,15 @@
 # Tuya Proxy Companion
 
-A Home Assistant OS add-on that acts as a MITM proxy for Tuya-based cameras.
-It intercepts the camera's cloud MQTT traffic, detects motion events locally,
-and routes them to [Frigate NVR](https://frigate.video) — without any internet
-dependency and without blocking the camera from functioning normally in the
-SmartLife app.
+A Home Assistant OS add-on for Tuya-based cameras with two independent features:
+
+**Proxy mode** — intercepts the camera's cloud MQTT traffic and routes motion
+events (DP 212) locally to [Frigate NVR](https://frigate.video) via the Tuya
+local protocol on LAN (port 6668). No internet dependency.
+
+**Privacy blocking mode** — uses ARP spoofing and iptables FORWARD rules to
+restrict the camera to the minimum internet access required for local
+functionality, blocking SmartLife push notifications and video upload to the
+cloud while keeping Frigate recording operational.
 
 Designed to work alongside the
 [eKaza Wizard](https://github.com/felipearmat/ekaza-wizard) custom integration.
@@ -44,14 +49,13 @@ Camera (LAN)
   └── DP 212 push (ipc_motion) → POST /api/events/{slug}/motion/create → Frigate
 ```
 
-### Secondary: Cloud MQTT MITM (iptables-based)
+### Secondary: Cloud MQTT MITM — proxy mode (iptables-based)
 
-For cameras where local protocol access is unavailable, the companion can
-intercept the camera's cloud MQTT traffic using iptables.
+Intercepts the camera's cloud MQTT traffic on the primary MQTT port.
 
-1. **iptables PREROUTING redirect** — a `REDIRECT` rule rewrites destination
-   port 8883 → proxy port (default 18883). Traffic is intercepted at the
-   network level; no DNS rewrite is needed when the primary local listener is active.
+1. **iptables PREROUTING REDIRECT** — rewrites destination port 8883 → proxy
+   port (default 18883). Requires an AdGuard DNS rewrite so the camera resolves
+   its MQTT domain to the HAOS host IP (managed automatically by eKaza Wizard).
 
 2. **TLS MITM** — the proxy presents a self-signed certificate to the camera.
    The camera connects believing it reached the cloud broker.
@@ -62,7 +66,7 @@ intercept the camera's cloud MQTT traffic using iptables.
 
 ```
 Camera (LAN)
-  │  TCP :8883 → m.tuyaus.com (no DNS rewrite needed — iptables intercepts at L3)
+  │  TCP :8883 → HAOS (via AdGuard DNS rewrite)
   │
   ▼ iptables PREROUTING REDIRECT (host network)
   │  TCP :18883
@@ -70,6 +74,39 @@ Camera (LAN)
   ▼ Companion MITM proxy
   ├── Known camera → DP 212 detected → Frigate
   └── Unknown camera → relay to m.tuyaus.com:8883
+```
+
+### Privacy blocking mode (ARP spoof + iptables FORWARD)
+
+Activated independently from proxy mode by the **SmartLife/Tuya blocking**
+feature in eKaza Wizard's Privacy tab (`privacy_blocked: true` per camera).
+Requires proxy mode to also be active.
+
+1. **ARP spoofing** — periodic unicast ARP replies claiming the HAOS MAC as the
+   gateway. All camera internet traffic is routed through HAOS (interval: 8 s).
+
+2. **Extra PREROUTING REDIRECTs** — ports 8886 and 443 also redirected to the
+   MITM proxy, covering MQTT-over-TLS alternative port and MQTT-over-WebSocket.
+
+3. **FORWARD DROP UDP** — all UDP except DNS (53) and NTP (123) is dropped,
+   blocking WebRTC DTLS, STUN/TURN, QUIC-based video upload.
+
+4. **FORWARD DROP HTTP** — TCP port 80 dropped (plain-HTTP clip upload path).
+
+5. **FORWARD ACCEPT TCP** — all remaining TCP is forwarded so the camera can
+   make cloud connection attempts on non-standard ports. This keeps the camera
+   in "reconnecting" state, which is required for DP 212 local events to flow.
+
+```
+Camera (LAN)
+  │  ARP reply: gateway MAC = HAOS MAC (every 8 s)
+  │
+  ▼ All internet-bound traffic routed through HAOS
+  │
+  ├── TCP :8883, :8886, :443 → PREROUTING REDIRECT → MITM (TLS error → no cloud MQTT)
+  ├── UDP (except DNS/NTP) → FORWARD DROP
+  ├── TCP :80 → FORWARD DROP
+  └── TCP (other) → FORWARD ACCEPT (keeps camera in reconnecting state for DP 212)
 ```
 
 ---
@@ -121,9 +158,11 @@ The companion exposes a local HTTP API on `localhost:8765`. The
 [eKaza Wizard](https://github.com/felipearmat/ekaza-wizard) custom integration
 auto-detects the companion at startup (no manual configuration needed) and:
 
-- Sends the list of proxy-enabled cameras via `POST /cameras`
-- The companion reconciles iptables rules (adds for enabled, removes for disabled)
-- On camera proxy toggle in the Privacy tab, the companion is re-synced immediately
+- Sends the camera list via `POST /cameras`; each camera carries two flags:
+  - `proxy_enabled` — activates PREROUTING REDIRECT + local Tuya listener
+  - `privacy_blocked` — activates ARP spoof + gateway FORWARD rules (requires `proxy_enabled`)
+- On proxy toggle or SmartLife blocking toggle, the companion is re-synced immediately
+- New cameras inherit the current `privacy_blocked` state automatically
 
 If the companion is not installed, eKaza Wizard falls back to an in-process proxy
 that lacks iptables support (traffic interception only works if the camera connects
@@ -133,10 +172,12 @@ directly on the proxy port, not via iptables redirect).
 
 | Method | Path | Description |
 |---|---|---|
-| `GET` | `/status` | Returns version, proxy state, active cameras, iptables rules |
-| `POST` | `/cameras` | Sync camera list; reconciles iptables rules |
+| `GET` | `/status` | Returns version, proxy state, cameras, iptables rules, `gateway_ips` |
+| `POST` | `/cameras` | Sync camera list; reconciles proxy and privacy rules per camera |
 | `POST` | `/proxy/start` | Start the MITM proxy (auto-started at boot) |
 | `POST` | `/proxy/stop` | Stop proxy and flush all iptables rules |
+
+`/cameras` body: `{"cameras": [{"slug": "...", "ip": "...", "proxy_enabled": bool, "privacy_blocked": bool, "device_id": "...", "local_key": "...", "tuya_mqtt_domain": "..."}]}`
 
 ---
 
@@ -161,8 +202,9 @@ Tested on:
 - The self-signed certificate presented to the camera is generated locally at
   startup and cached in `/data/proxy_certs/`. It is never transmitted outside
   the local network.
-- The iptables rules are per-camera-IP and surgical: they only affect traffic
-  originating from the specific camera's IP address on port 8883. All other
-  devices and all other ports are unaffected.
+- All iptables rules (PREROUTING and FORWARD) are scoped to the specific
+  camera's IP address (`-s <cam_ip>`). Other devices on the network are unaffected.
+- Privacy blocking mode uses ARP spoofing, which is local to the segment and
+  only redirects the camera's default gateway resolution — not a broadcast storm.
 - The companion does **not** store or log any camera credentials or Tuya payloads.
 - When the add-on stops, all iptables rules are flushed automatically.
