@@ -3,7 +3,7 @@ FROM alpine:3.19
 RUN apk add --no-cache python3 py3-pip iptables openssl wget \
     && pip3 install --no-cache-dir --break-system-packages aiohttp cryptography tinytuya
 
-ARG BUILD_VERSION=0.2.7
+ARG BUILD_VERSION=0.2.8
 
 # Download source directly from GitHub to bypass stale build context
 RUN mkdir -p /proxy && \
